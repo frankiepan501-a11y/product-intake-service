@@ -2,27 +2,28 @@
 
 ## 定位
 
-这套脚本接管「采购填写产品信息维护表 -> 系统合成 SKU/品名 -> Frankie 点卡确认 -> 领星建品」中的前半段。
+这套脚本接管「采购填写产品信息维护表 -> 系统合成 SKU/品名 -> 采购点卡确认 -> 领星建品」链路。
 
 系统化目标：
 
 - 表单新记录如果已满足关键字段，自动补 `建档状态=待合成`。
 - `待合成` 记录自动合成 `ERP SKU`、`ERP品名`、类目字段，并转为 `待确认`。
-- 合成后给 Frankie 发确认卡。是否真正建领星仍由确认按钮作为人审 gate。
+- 合成后给采购群发确认卡。是否真正建领星仍由确认按钮作为人审 gate。
 - 采购确认后，`确认建品` 记录可由 `create-confirmed` 建入领星并回写 `已建领星`。
 - 支持 `--record-id` 单条回放，便于定位某一条为什么没跑。
 
 ## 执行形态
 
-- 当前正式入口：本地确定性脚本 `product_intake.py`。
-- 云端入口：`service.py` 提供 FastAPI 包装服务；部署后由 n8n Cron 调 `/run` 和 `/create-confirmed`。
+- 当前正式入口：Zeabur FastAPI 服务，由 n8n Cron 调 `/run` 和 `/create-confirmed`。
+- 本地入口：`product_intake.py` 保留作单条回放和调试。
 - 人审 gate：飞书确认卡按钮。SKU 建后不可随意改，不能跳过此 gate。
 
 当前状态：
 
 - 代码已迁出 scratchpad。
-- FastAPI 包装服务已写好。
-- 尚未部署 Zeabur，也尚未创建 n8n cron；因此当前仍依赖本机手动运行正式脚本。
+- Zeabur 服务已部署：`https://product-intake-fp501.zeabur.app`。
+- n8n Cron 已上线并完成首轮 execution 验证。
+- 当前不依赖本机定时脚本；本地脚本仅作回放/修复工具。
 
 ## 必需环境变量
 
@@ -90,7 +91,7 @@ python C:/Users/Administrator/scripts/product_intake/product_intake.py --record-
 
 ## 云端服务
 
-本目录已包含 Zeabur/FastAPI 服务入口：
+Zeabur/FastAPI 服务入口：
 
 - `service.py`
 - `requirements.txt`
@@ -108,6 +109,29 @@ python C:/Users/Administrator/scripts/product_intake/product_intake.py --record-
 ```http
 Authorization: Bearer <PRODUCT_INTAKE_SERVICE_TOKEN>
 ```
+
+生产部署：
+
+- GitHub repo: `frankiepan501-a11y/product-intake-service`
+- Zeabur service: `product-intake-service` / `6a4391ba22d1fdaf7eb12475`
+- Zeabur domain: `https://product-intake-fp501.zeabur.app`
+- Zeabur environment: `production` / `69856f0c86311f632dc2c2c9`
+
+n8n 工作流：
+
+- `产品信息表新品建档 - Intake Compose` / `3HaNkKXOtPksUDQc`
+  - 每 5 分钟调用 `POST /run`
+  - 请求体：`{"dry_run":false,"send_card":true}`
+- `产品信息表新品建档 - Create Confirmed` / `iEY21oFaMhPblsjE`
+  - 每 5 分钟调用 `POST /create-confirmed`
+  - 请求体：`{"dry_run":false}`
+
+上线验证：
+
+- `GET /health` 返回 `{"status":"ok"}`。
+- `/run` dry-run 通过。
+- `/create-confirmed` dry-run 通过。
+- 两个 n8n workflow 均已 active，`activeVersionId` 已绑定，首轮 execution 均为 `success`。
 
 ## 品牌口径
 
