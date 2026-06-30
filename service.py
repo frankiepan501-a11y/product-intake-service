@@ -39,8 +39,24 @@ def check_auth(authorization: str = "") -> None:
 
 def invoke(args: List[str]) -> Dict[str, Any]:
     buf = io.StringIO()
-    with redirect_stdout(buf):
-        code = product_intake.main(args)
+    try:
+        with redirect_stdout(buf):
+            code = product_intake.main(args)
+    except SystemExit as exc:
+        code = int(exc.code) if isinstance(exc.code, int) else 1
+        return {
+            "ok": False,
+            "code": code,
+            "error": str(exc),
+            "stdout": buf.getvalue().splitlines(),
+        }
+    except Exception as exc:
+        return {
+            "ok": False,
+            "code": 1,
+            "error": f"{type(exc).__name__}: {exc}",
+            "stdout": buf.getvalue().splitlines(),
+        }
     return {"ok": code == 0, "code": code, "stdout": buf.getvalue().splitlines()}
 
 
