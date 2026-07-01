@@ -35,7 +35,7 @@ LAST_LOCK_ALERT_AT: Optional[datetime] = None
 LOCK_ALERT_AFTER_SEC = int(os.getenv("PRODUCT_INTAKE_LOCK_ALERT_AFTER_SEC", "600"))
 LOCK_ALERT_COOLDOWN_SEC = int(os.getenv("PRODUCT_INTAKE_LOCK_ALERT_COOLDOWN_SEC", "1800"))
 
-APP_VERSION = "2026-07-01-sku-validation-card"
+APP_VERSION = "2026-07-01-color-code-normalize"
 
 app = FastAPI(title="Product Intake Service", version=APP_VERSION)
 
@@ -267,7 +267,7 @@ def format_error_block(markers: List[Dict[str, Any]], result: Dict[str, Any]) ->
         return "\n".join(
             [
                 "- 根因：领星 SKU 字符规则校验失败，ERP SKU 里出现中文或非法字符。",
-                "- 需要修改：检查「颜色变体」和「套餐变体」，改成英文/数字代码；例如黑色=`BK`、白色=`WH`、银色=`SL` 或公司约定代码。",
+                "- 需要修改：若是常见颜色，系统会自动转码；仍报错时请检查「套餐变体」是否混入中文，或找系统负责人补颜色映射。",
                 "- 本次异常 SKU：",
                 *sku_lines,
                 more,
@@ -323,7 +323,7 @@ def unique_marker_skus(markers: List[Dict[str, Any]]) -> List[str]:
 
 def owner_action_for_markers(markers: List[Dict[str, Any]]) -> str:
     if markers_have_lingxing_sku_rule_error(markers):
-        return "采购先打开上方产品记录，把「颜色变体/套餐变体」里的中文改成英文 SKU 代码；修好后勾选「采购已修改」重新提交。系统负责人只在不确定代码规则时介入。"
+        return "采购可继续用中文填写常见颜色；若仍报错，先检查「套餐变体」是否用了中文，或找系统负责人补颜色映射。修好后勾选「采购已修改」重新提交。"
     return "请采购先打开记录，按“具体报错/下一步”修正字段；无法判断时转系统负责人处理。修好后勾选「采购已修改」重新提交。"
 
 
@@ -344,9 +344,9 @@ def humanize_error(action: str, raw: str) -> str:
     if "ERP SKU/ERP品名未合成" in text:
         return "记录还没有成功合成 ERP SKU/ERP 品名，不能进入领星建品。"
     if "ERP SKU 含非法字符" in text:
-        return "ERP SKU 含中文或非法字符。请把颜色/套餐变体改成英文 SKU 代码后重新提交。"
+        return "ERP SKU 含非法字符。常见中文颜色会自动转码；请检查套餐变体是否用了中文，或找系统负责人补颜色映射。"
     if "SKU 只允许" in text:
-        return "ERP SKU 含中文或非法字符。请把颜色/套餐变体改成英文 SKU 代码后重新提交。"
+        return "ERP SKU 含非法字符。常见中文颜色会自动转码；请检查套餐变体是否用了中文，或找系统负责人补颜色映射。"
     if action == "create_failed":
         return "领星接口拒绝建品。通常需要系统负责人查看领星返回内容。"
     return short_text(text, 180) or "未提供错误明细。"

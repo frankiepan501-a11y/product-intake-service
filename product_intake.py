@@ -93,6 +93,39 @@ SUPPLIER_WORDS = (
 )
 
 SKU_ALLOWED_RE = re.compile(r"^[A-Za-z0-9_.#/\-]+$")
+COLOR_CODE_ALIASES: Dict[str, str] = {
+    "黑": "BK",
+    "黑色": "BK",
+    "雅黑": "BK",
+    "白": "WH",
+    "白色": "WH",
+    "米白": "WH",
+    "红": "RD",
+    "红色": "RD",
+    "蓝": "BL",
+    "蓝色": "BL",
+    "绿": "GN",
+    "绿色": "GN",
+    "粉": "PK",
+    "粉色": "PK",
+    "灰": "GY",
+    "灰色": "GY",
+    "深灰": "GY",
+    "浅灰": "GY",
+    "黄": "YE",
+    "黄色": "YE",
+    "橙": "OR",
+    "橙色": "OR",
+    "紫": "PU",
+    "紫色": "PU",
+    "银": "SL",
+    "银色": "SL",
+    "金": "GD",
+    "金色": "GD",
+    "透明": "CT",
+    "透明色": "CT",
+    "清透": "CT",
+}
 
 
 @dataclass
@@ -344,7 +377,24 @@ def validate_erp_sku(sku: str) -> None:
     raise ValueError(
         "ERP SKU 含非法字符"
         + (f"：{invalid}" if invalid else "")
-        + "。颜色变体/套餐变体必须使用英文或数字代码，例如黑色=BK、白色=WH，不要填中文。"
+        + "。颜色会由系统自动转成 SKU 代码；若仍报错，请补充颜色映射或检查套餐变体是否为英文/数字代码。"
+    )
+
+
+def sku_variant_code(value: str, kind: str = "variant") -> str:
+    text = value.strip()
+    if not text:
+        return ""
+    compact = re.sub(r"[\s_/／]+", "", text)
+    if kind == "color":
+        mapped = COLOR_CODE_ALIASES.get(compact)
+        if mapped:
+            return mapped
+    if SKU_ALLOWED_RE.fullmatch(text):
+        return text.upper() if kind == "color" else text
+    raise ValueError(
+        f"{'颜色变体' if kind == 'color' else '套餐变体'}无法转换为 SKU 代码：{text}。"
+        + ("请在系统颜色映射表补充该颜色口径。" if kind == "color" else "请使用英文或数字代码。")
     )
 
 
@@ -435,7 +485,10 @@ def compose_row(
 
     prefix = f"{brand_codes[brand]}-{category['品类码']}-{category['平台码']}-"
     sequence = next_sequence(prefix, existing_skus)
-    variants = [cell_text(fields.get(FIELD_COLOR)), cell_text(fields.get(FIELD_BUNDLE))]
+    variants = [
+        sku_variant_code(cell_text(fields.get(FIELD_COLOR)), "color"),
+        sku_variant_code(cell_text(fields.get(FIELD_BUNDLE)), "bundle"),
+    ]
     variants = [item for item in variants if item]
     sku = prefix + sequence + (("-" + "-".join(variants)) if variants else "")
     validate_erp_sku(sku)
