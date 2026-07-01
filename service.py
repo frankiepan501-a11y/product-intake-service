@@ -13,6 +13,7 @@ import os
 import threading
 import uuid
 from contextlib import redirect_stdout
+from datetime import datetime, timedelta, timezone
 from typing import Any, Dict, List, Optional
 
 from fastapi import FastAPI, Header, HTTPException
@@ -30,7 +31,7 @@ ERROR_ACTIONS = {"compose_error", "create_error", "create_failed"}
 MUTATING_LOCK = threading.Lock()
 ACTIVE_RUN: Dict[str, str] = {}
 
-APP_VERSION = "2026-07-01-p0-guards"
+APP_VERSION = "2026-07-01-alert-card"
 
 app = FastAPI(title="Product Intake Service", version=APP_VERSION)
 
@@ -66,6 +67,10 @@ def parse_events(stdout: List[str]) -> List[Dict[str, Any]]:
 
 def error_events(result: Dict[str, Any]) -> List[Dict[str, Any]]:
     events = parse_events(result.get("stdout") or [])
+    for key in ("results", "errors"):
+        rows = result.get(key) or []
+        if isinstance(rows, list):
+            events.extend([item for item in rows if isinstance(item, dict)])
     return [item for item in events if item.get("action") in ERROR_ACTIONS]
 
 
@@ -93,6 +98,25 @@ def send_text(client: product_intake.FeishuClient, receive_id_type: str, receive
     )
 
 
+def send_interactive_card(
+    client: product_intake.FeishuClient,
+    receive_id_type: str,
+    receive_id: str,
+    card: Dict[str, Any],
+) -> None:
+    if not receive_id:
+        return
+    client.request(
+        "POST",
+        f"/im/v1/messages?receive_id_type={receive_id_type}",
+        body={
+            "receive_id": receive_id,
+            "msg_type": "interactive",
+            "content": json.dumps(card, ensure_ascii=False),
+        },
+    )
+
+
 def resolve_open_id(client: product_intake.FeishuClient, email: str) -> str:
     if not email:
         return ""
@@ -107,67 +131,245 @@ def resolve_open_id(client: product_intake.FeishuClient, email: str) -> str:
     return ""
 
 
+def now_bj() -> str:
+    return datetime.now(timezone(timedelta(hours=8))).strftime("%Y-%m-%d %H:%M:%S")
+
+
+def short_text(value: str, limit: int = 80) -> str:
+    value = value.replace("\n", " ").strip()
+    return value if len(value) <= limit else value[: limit - 1] + "…"
+
+
+def classify_alert(endpoint: str, result: Dict[str, Any], markers: List[Dict[str, Any]]) -> Dict[str, str]:
+    if result.get("locked"):
+        return {
+            "level": "P2",
+            "template": "yellow",
+            "title": "🟡 [LOG·P2] 新品建档运行锁 · 自动保护",
+            "problem": "系统正在处理上一轮任务，本轮请求被运行锁拦截，避免 SKU 序号并发撞号。",
+            "owner_action": "采购无需处理。若连续 10 分钟仍出现，请把本卡转给系统负责人排查上一轮任务是否卡住。",
+        }
+    actions = {str(item.get("action") or "") for item in markers}
+    if "create_failed" in actions:
+        problem = "领星建品接口返回失败，产品没有成功写入领星。"
+    elif "create_error" in actions:
+        problem = "系统无法组装领星建品参数，通常是 SKU/品名/类目或物理字段不完整。"
+    elif "compose_error" in actions:
+        problem = "系统无法合成 ERP SKU/ERP 品名，通常是品牌、类目配置、款式等关键字段缺失或不符合规则。"
+    else:
+        problem = result.get("error") or "服务执行失败，未能完成本轮新品建档任务。"
+    return {
+        "level": "P1",
+        "template": "red" if "create_failed" in actions else "orange",
+        "title": "🟠 [LOG·P1] 新品建档异常 · 需处理",
+        "problem": problem,
+        "owner_action": "请采购先打开记录，按“具体报错/下一步”修正字段；无法判断时转系统负责人处理。修好后勾选「采购已修改」重新提交。",
+    }
+
+
+def load_product_snapshots(record_ids: List[str]) -> Dict[str, Dict[str, str]]:
+    app_id = os.getenv("FEISHU_APP2_ID", "").strip()
+    app_secret = os.getenv("FEISHU_APP2_SECRET", "").strip()
+    if not app_id or not app_secret:
+        return {}
+    client = product_intake.FeishuClient(app_id, app_secret)
+    snapshots: Dict[str, Dict[str, str]] = {}
+    for rid in dict.fromkeys([item for item in record_ids if item]):
+        try:
+            row = product_intake.get_record(client, rid)
+            fields = row.get("fields", {})
+            snapshots[rid] = {
+                "sku": product_intake.cell_text(fields.get(product_intake.FIELD_ERP_SKU)),
+                "name": product_intake.cell_text(fields.get(product_intake.FIELD_ERP_NAME)),
+                "brand": product_intake.cell_text(fields.get(product_intake.FIELD_BRAND)),
+                "factory_model": product_intake.cell_text(fields.get(product_intake.FIELD_FACTORY_MODEL)),
+                "style": product_intake.cell_text(fields.get(product_intake.FIELD_STYLE)),
+                "status": product_intake.cell_text(fields.get(product_intake.STATUS_FIELD)),
+                "record_url": product_intake.record_url(rid),
+            }
+        except Exception as exc:
+            snapshots[rid] = {
+                "sku": "",
+                "name": "",
+                "brand": "",
+                "factory_model": "",
+                "style": "",
+                "status": "",
+                "record_url": product_intake.record_url(rid),
+                "load_error": f"{type(exc).__name__}: {exc}",
+            }
+    return snapshots
+
+
+def format_product_block(record_ids: List[str], products: Dict[str, Dict[str, str]]) -> str:
+    if not record_ids:
+        return "- 本次异常没有绑定具体产品记录。"
+    lines: List[str] = []
+    for rid in record_ids:
+        info = products.get(rid, {})
+        title = info.get("name") or info.get("sku") or info.get("factory_model") or info.get("style") or "未合成产品"
+        details = []
+        if info.get("sku"):
+            details.append(f"SKU: {info['sku']}")
+        if info.get("brand"):
+            details.append(f"品牌: {info['brand']}")
+        if info.get("factory_model"):
+            details.append(f"工厂型号: {info['factory_model']}")
+        if info.get("style"):
+            details.append(f"款式: {info['style']}")
+        if info.get("status"):
+            details.append(f"状态: {info['status']}")
+        lines.append(f"- [{short_text(title, 40)}]({info.get('record_url') or product_intake.record_url(rid)})")
+        if details:
+            lines.append("  " + "；".join(details))
+    return "\n".join(lines)
+
+
+def format_error_block(markers: List[Dict[str, Any]], result: Dict[str, Any]) -> str:
+    if result.get("locked"):
+        return "- 运行锁：上一轮任务仍在执行，本轮被拦截。不是采购资料错误。"
+    if not markers and result.get("error"):
+        return f"- 服务错误：{short_text(str(result.get('error')), 180)}"
+    lines: List[str] = []
+    for item in markers:
+        action = str(item.get("action") or "error")
+        rid = str(item.get("record_id") or "无记录")
+        raw = item.get("error") if item.get("error") is not None else item.get("result", "")
+        if not isinstance(raw, str):
+            raw = json.dumps(raw, ensure_ascii=False)
+        human = humanize_error(action, raw)
+        lines.append(f"- {action} / {rid}：{human}")
+        if raw and human != raw:
+            lines.append(f"  原始信息：{short_text(raw, 160)}")
+    return "\n".join(lines) if lines else "- 未识别到具体错误，请看 replay 命令复现。"
+
+
+def humanize_error(action: str, raw: str) -> str:
+    text = raw or ""
+    if "品牌缺" in text:
+        return "品牌为空。请采购在「品牌」字段填写真实品牌；供应商名不要填进品牌。"
+    if "品牌未配置品牌码" in text:
+        return "品牌没有配置品牌码。请先确认是否真实品牌；真实品牌需找系统负责人补品牌码。"
+    if "品牌疑似供应商名" in text:
+        return "品牌疑似填了供应商/公司名。请改成真实品牌；铺货通用款填「白牌」。"
+    if "类目配置缺" in text:
+        return "类目配置为空。请选择最接近的平台+叶子类目；没有合适项找系统负责人补类目。"
+    if "类目配置未找到" in text:
+        return "关联的类目配置不存在或被删。请重新选择类目配置。"
+    if "款式缺" in text:
+        return "款式为空。请填写外观/模具/功能形态短名，不要混入平台、颜色、工厂型号。"
+    if "ERP SKU/ERP品名未合成" in text:
+        return "记录还没有成功合成 ERP SKU/ERP 品名，不能进入领星建品。"
+    if action == "create_failed":
+        return "领星接口拒绝建品。通常需要系统负责人查看领星返回内容。"
+    return short_text(text, 180) or "未提供错误明细。"
+
+
+def build_alert_card(endpoint: str, result: Dict[str, Any], run_id: str, args: List[str]) -> Dict[str, Any]:
+    markers = error_events(result)
+    record_ids: List[str] = []
+    for item in markers:
+        rid = str(item.get("record_id") or "")
+        if rid:
+            record_ids.append(rid)
+    record_ids = list(dict.fromkeys(record_ids))
+    products = load_product_snapshots(record_ids)
+    profile = classify_alert(endpoint, result, markers)
+    first_record = record_ids[0] if record_ids else ""
+    replay = replay_command(endpoint, first_record)
+    product_block = format_product_block(record_ids, products)
+    error_block = format_error_block(markers, result)
+
+    elements: List[Dict[str, Any]] = [
+        {
+            "tag": "div",
+            "text": {
+                "tag": "lark_md",
+                "content": "\n".join(
+                    [
+                        "**时间**：" + now_bj(),
+                        "**影响环节**：" + endpoint,
+                        "**问题说明**：" + profile["problem"],
+                    ]
+                ),
+            },
+        },
+        {"tag": "hr"},
+        {"tag": "div", "text": {"tag": "lark_md", "content": "**影响产品**\n" + product_block}},
+        {"tag": "hr"},
+        {"tag": "div", "text": {"tag": "lark_md", "content": "**具体报错**\n" + error_block}},
+        {
+            "tag": "div",
+            "text": {
+                "tag": "lark_md",
+                "content": "**下一步**\n"
+                + "\n".join(
+                    [
+                        "- " + profile["owner_action"],
+                        "- 技术排查用 replay：`" + replay + "`",
+                        "- run_id：`" + run_id + "`；code：`" + str(result.get("code")) + "`",
+                    ]
+                ),
+            },
+        },
+    ]
+    if first_record:
+        elements.append(
+            {
+                "tag": "action",
+                "actions": [
+                    {
+                        "tag": "button",
+                        "text": {"tag": "plain_text", "content": "打开产品记录"},
+                        "type": "primary",
+                        "url": product_intake.record_url(first_record),
+                    }
+                ],
+            }
+        )
+
+    return {
+        "config": {"wide_screen_mode": True},
+        "header": {
+            "template": profile["template"],
+            "title": {"tag": "plain_text", "content": profile["title"]},
+        },
+        "elements": elements,
+    }
+
+
 def notify_failure(endpoint: str, result: Dict[str, Any], run_id: str, args: List[str]) -> Dict[str, Any]:
     event_app_id = os.getenv("FEISHU_EVENT_APP_ID", "").strip()
     event_app_secret = os.getenv("FEISHU_EVENT_APP_SECRET", "").strip()
     if not event_app_id or not event_app_secret:
         return {"sent": False, "error": "missing FEISHU_EVENT_APP_ID/SECRET"}
 
-    markers = error_events(result)
-    record_ids = []
-    lines = []
-    for item in markers:
-        rid = str(item.get("record_id") or "")
-        if rid:
-            record_ids.append(rid)
-        msg = item.get("error") or item.get("result") or item
-        lines.append(f"- {item.get('action')}: {rid or 'no-record'} | {msg}")
-
-    if not lines and result.get("error"):
-        lines.append(f"- service_error: {result.get('error')}")
-    if not lines and result.get("locked"):
-        lines.append(f"- lock_busy: {result.get('error')}")
-
-    first_record = record_ids[0] if record_ids else ""
-    text = "\n".join(
-        [
-            "[PROD·P1] 产品新品建档异常",
-            f"endpoint: {endpoint}",
-            f"run_id: {run_id}",
-            f"record_id: {', '.join(record_ids) if record_ids else '-'}",
-            f"ok/code: {result.get('ok')} / {result.get('code')}",
-            "errors:",
-            *(lines or ["- unknown error"]),
-            f"replay: {replay_command(endpoint, first_record)}",
-            f"args: {' '.join(args)}",
-        ]
-    )
-
     client = product_intake.FeishuClient(event_app_id, event_app_secret)
+    card = build_alert_card(endpoint, result, run_id, args)
     sent: List[str] = []
     errors: List[str] = []
     try:
-        send_text(client, "chat_id", ALERT_CHAT_ID, text)
+        send_interactive_card(client, "chat_id", ALERT_CHAT_ID, card)
         sent.append("chat")
     except Exception as exc:
         errors.append(f"chat: {type(exc).__name__}: {exc}")
 
     try:
         if ALERT_OPEN_ID:
-            send_text(client, "open_id", ALERT_OPEN_ID, text)
+            send_interactive_card(client, "open_id", ALERT_OPEN_ID, card)
             sent.append("open_id")
         elif ALERT_UNION_ID:
-            send_text(client, "union_id", ALERT_UNION_ID, text)
+            send_interactive_card(client, "union_id", ALERT_UNION_ID, card)
             sent.append("union_id")
         else:
             open_id = resolve_open_id(client, ALERT_EMAIL)
             if open_id:
-                send_text(client, "open_id", open_id, text)
+                send_interactive_card(client, "open_id", open_id, card)
                 sent.append("email_open_id")
     except Exception as exc:
         errors.append(f"user: {type(exc).__name__}: {exc}")
 
-    return {"sent": bool(sent), "targets": sent, "errors": errors}
+    return {"sent": bool(sent), "targets": sent, "errors": errors, "card_title": card["header"]["title"]["content"]}
 
 
 def invoke(args: List[str]) -> Dict[str, Any]:

@@ -109,7 +109,8 @@ Zeabur/FastAPI 服务入口：
 
 - 非 dry-run 的 `/run`、`/send-card`、`/create-confirmed` 会走进程内运行锁，避免并发执行导致 SKU 序号撞号。
 - 服务会解析 stdout 里的 `compose_error`、`create_error`、`create_failed`。只要 mutating run 出错，就主动发异常通知到采购群，并尝试抄送 Frankie。
-- 异常通知包含 endpoint、run_id、record_id、错误、replay 命令。
+- 异常通知使用飞书交互卡片，不再发送 raw log 文本。卡片必须包含：北京时间、影响环节、影响产品、具体报错的运营解释、下一步处理人和动作、技术 replay/run_id。
+- 运行锁属于系统自动保护，卡片标 `LOG·P2` 并明确写“采购无需处理”；资料/建品失败标 `LOG·P1` 并要求采购或系统负责人处理。
 
 `PRODUCT_INTAKE_SERVICE_TOKEN` 设置后，n8n 调用时使用：
 
