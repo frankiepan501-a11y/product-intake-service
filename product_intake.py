@@ -42,6 +42,7 @@ STATUS_CONFIRM = "待确认"
 STATUS_FAILED = "失败"
 STATUS_CREATE = "确认建品"
 STATUS_BUILT = "已建领星"
+STATUS_REVISE = "待修改"
 
 FIELD_ERP_SKU = "ERP SKU"
 FIELD_ERP_NAME = "ERP品名"
@@ -60,6 +61,7 @@ FIELD_L1 = "一级分类"
 FIELD_L2 = "二级分类"
 FIELD_PRODUCT_TYPE = "产品类型"
 FIELD_STATUS = "状态"
+FIELD_RESUBMIT = os.getenv("PRODUCT_INTAKE_RESUBMIT_FIELD", "采购已修改")
 
 LX_CF_MAIN_PLATFORM = os.getenv("LINGXING_CF_MAIN_PLATFORM", "207716196418609155")
 LX_CF_COMPAT_PLATFORM = os.getenv("LINGXING_CF_COMPAT_PLATFORM", "207716196418609153")
@@ -342,11 +344,7 @@ def validate_row(fields: Dict[str, Any]) -> Tuple[List[str], List[str]]:
     return errors, warnings
 
 
-def should_default_to_todo(fields: Dict[str, Any]) -> bool:
-    if cell_text(fields.get(STATUS_FIELD)):
-        return False
-    if cell_text(fields.get(FIELD_ERP_SKU)) or cell_text(fields.get(FIELD_ERP_NAME)):
-        return False
+def has_required_intake_fields(fields: Dict[str, Any]) -> bool:
     required = (
         FIELD_BRAND,
         FIELD_CATEGORY,
@@ -355,6 +353,24 @@ def should_default_to_todo(fields: Dict[str, Any]) -> bool:
         FIELD_COMPAT_PLATFORM,
     )
     return all(fields.get(name) not in (None, "", []) for name in required)
+
+
+def cell_bool(value: Any) -> bool:
+    if isinstance(value, bool):
+        return value
+    text = cell_text(value).lower()
+    return text in ("true", "1", "yes", "y", "是", "已修改", "重新提交")
+
+
+def should_default_to_todo(fields: Dict[str, Any]) -> bool:
+    status = cell_text(fields.get(STATUS_FIELD))
+    if not status:
+        if cell_text(fields.get(FIELD_ERP_SKU)) or cell_text(fields.get(FIELD_ERP_NAME)):
+            return False
+        return has_required_intake_fields(fields)
+    if status == STATUS_REVISE and cell_bool(fields.get(FIELD_RESUBMIT)):
+        return has_required_intake_fields(fields)
+    return False
 
 
 def compose_row(fields: Dict[str, Any], categories: Dict[str, Dict[str, str]], existing_skus: Iterable[str]) -> Tuple[Dict[str, Any], List[str]]:
@@ -491,7 +507,7 @@ def build_card(record_id: str, fields: Dict[str, Any], warnings: List[str]) -> D
                 "elements": [
                     {
                         "tag": "plain_text",
-                        "content": "请采购核对：生成结果是否符合你提交的信息，缺失字段是否可接受。确认后才进入下一步建品。",
+                        "content": "请采购核对：生成结果是否符合你提交的信息，缺失字段是否可接受。退回后改完资料需勾选「采购已修改」，系统才会重新合成并发新卡。",
                     }
                 ],
             },
@@ -609,7 +625,10 @@ def cmd_default_status(client: FeishuClient, args: argparse.Namespace) -> int:
             continue
         errors, warnings = validate_row(fields)
         payload = {STATUS_FIELD: STATUS_TODO}
-        print(json.dumps({"action": "default_status", "record_id": rid, "fields": payload, "errors": errors, "warnings": warnings}, ensure_ascii=False))
+        if FIELD_RESUBMIT in fields:
+            payload[FIELD_RESUBMIT] = False
+        action = "resubmit_status" if cell_text(fields.get(STATUS_FIELD)) == STATUS_REVISE else "default_status"
+        print(json.dumps({"action": action, "record_id": rid, "fields": payload, "errors": errors, "warnings": warnings}, ensure_ascii=False))
         if not args.dry_run:
             update_record(client, rid, payload)
         changed += 1
