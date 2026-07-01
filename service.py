@@ -35,7 +35,7 @@ LAST_LOCK_ALERT_AT: Optional[datetime] = None
 LOCK_ALERT_AFTER_SEC = int(os.getenv("PRODUCT_INTAKE_LOCK_ALERT_AFTER_SEC", "600"))
 LOCK_ALERT_COOLDOWN_SEC = int(os.getenv("PRODUCT_INTAKE_LOCK_ALERT_COOLDOWN_SEC", "1800"))
 
-APP_VERSION = "2026-07-01-alert-card-diagnosis"
+APP_VERSION = "2026-07-01-sku-validation-card"
 
 app = FastAPI(title="Product Intake Service", version=APP_VERSION)
 
@@ -343,6 +343,8 @@ def humanize_error(action: str, raw: str) -> str:
         return "款式为空。请填写外观/模具/功能形态短名，不要混入平台、颜色、工厂型号。"
     if "ERP SKU/ERP品名未合成" in text:
         return "记录还没有成功合成 ERP SKU/ERP 品名，不能进入领星建品。"
+    if "ERP SKU 含非法字符" in text:
+        return "ERP SKU 含中文或非法字符。请把颜色/套餐变体改成英文 SKU 代码后重新提交。"
     if "SKU 只允许" in text:
         return "ERP SKU 含中文或非法字符。请把颜色/套餐变体改成英文 SKU 代码后重新提交。"
     if action == "create_failed":

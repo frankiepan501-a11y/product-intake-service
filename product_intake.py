@@ -92,6 +92,8 @@ SUPPLIER_WORDS = (
     "实业",
 )
 
+SKU_ALLOWED_RE = re.compile(r"^[A-Za-z0-9_.#/\-]+$")
+
 
 @dataclass
 class Config:
@@ -333,6 +335,19 @@ def next_sequence(prefix: str, existing_skus: Iterable[str]) -> str:
     return f"{max_num + 1:03d}"
 
 
+def validate_erp_sku(sku: str) -> None:
+    if not sku:
+        raise ValueError("ERP SKU 缺")
+    if SKU_ALLOWED_RE.fullmatch(sku):
+        return
+    invalid = "".join(dict.fromkeys(ch for ch in sku if not re.match(r"[A-Za-z0-9_.#/\-]", ch)))
+    raise ValueError(
+        "ERP SKU 含非法字符"
+        + (f"：{invalid}" if invalid else "")
+        + "。颜色变体/套餐变体必须使用英文或数字代码，例如黑色=BK、白色=WH，不要填中文。"
+    )
+
+
 def looks_like_supplier_as_brand(brand: str, brand_codes: Optional[Dict[str, str]] = None) -> bool:
     if not brand:
         return False
@@ -423,6 +438,7 @@ def compose_row(
     variants = [cell_text(fields.get(FIELD_COLOR)), cell_text(fields.get(FIELD_BUNDLE))]
     variants = [item for item in variants if item]
     sku = prefix + sequence + (("-" + "-".join(variants)) if variants else "")
+    validate_erp_sku(sku)
 
     head = cell_text(fields.get(FIELD_FACTORY_MODEL)) or category["平台中文"]
     style = cell_text(fields.get(FIELD_STYLE))
@@ -856,6 +872,7 @@ def build_lingxing_payload(
     brand = cell_text(fields.get(FIELD_BRAND))
     if not sku or not name:
         raise ValueError("ERP SKU/ERP品名未合成")
+    validate_erp_sku(sku)
 
     payload: Dict[str, Any] = {"sku": sku, "product_name": name, "status": 2}
     if brand in bidmap:
