@@ -228,8 +228,22 @@ def run_command(endpoint: str, args: List[str], lock_required: bool, notify: boo
 
 
 @app.get("/health")
-def health() -> Dict[str, str]:
-    return {"status": "ok", "version": APP_VERSION}
+def health() -> Dict[str, Any]:
+    return {
+        "status": "ok",
+        "version": APP_VERSION,
+        "features": {
+            "run_lock": True,
+            "error_alert": True,
+            "resubmit_field": product_intake.FIELD_RESUBMIT,
+        },
+        "alert_config": {
+            "event_app_configured": bool(os.getenv("FEISHU_EVENT_APP_ID", "").strip())
+            and bool(os.getenv("FEISHU_EVENT_APP_SECRET", "").strip()),
+            "chat_configured": bool(ALERT_CHAT_ID),
+            "user_route_configured": bool(ALERT_OPEN_ID or ALERT_UNION_ID or ALERT_EMAIL),
+        },
+    }
 
 
 @app.post("/run")
