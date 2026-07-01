@@ -29,9 +29,12 @@ ALERT_OPEN_ID = os.getenv("PRODUCT_INTAKE_ALERT_OPEN_ID", "")
 ALERT_UNION_ID = os.getenv("PRODUCT_INTAKE_ALERT_UNION_ID", "")
 ERROR_ACTIONS = {"compose_error", "create_error", "create_failed"}
 MUTATING_LOCK = threading.Lock()
-ACTIVE_RUN: Dict[str, str] = {}
+ACTIVE_RUN: Dict[str, Any] = {}
+LAST_LOCK_ALERT_AT: Optional[datetime] = None
+LOCK_ALERT_AFTER_SEC = int(os.getenv("PRODUCT_INTAKE_LOCK_ALERT_AFTER_SEC", "600"))
+LOCK_ALERT_COOLDOWN_SEC = int(os.getenv("PRODUCT_INTAKE_LOCK_ALERT_COOLDOWN_SEC", "1800"))
 
-APP_VERSION = "2026-07-01-p1-routing-config"
+APP_VERSION = "2026-07-01-lock-alert-throttle"
 
 app = FastAPI(title="Product Intake Service", version=APP_VERSION)
 
@@ -135,9 +138,32 @@ def now_bj() -> str:
     return datetime.now(timezone(timedelta(hours=8))).strftime("%Y-%m-%d %H:%M:%S")
 
 
+def now_utc() -> datetime:
+    return datetime.now(timezone.utc)
+
+
 def short_text(value: str, limit: int = 80) -> str:
     value = value.replace("\n", " ").strip()
     return value if len(value) <= limit else value[: limit - 1] + "…"
+
+
+def active_run_age_sec(active: Dict[str, Any]) -> int:
+    started_at = active.get("started_at")
+    if not isinstance(started_at, datetime):
+        return 0
+    return max(0, int((now_utc() - started_at).total_seconds()))
+
+
+def should_notify_lock_alert(active: Dict[str, Any]) -> bool:
+    global LAST_LOCK_ALERT_AT
+    age_sec = active_run_age_sec(active)
+    if age_sec < LOCK_ALERT_AFTER_SEC:
+        return False
+    now = now_utc()
+    if LAST_LOCK_ALERT_AT and (now - LAST_LOCK_ALERT_AT).total_seconds() < LOCK_ALERT_COOLDOWN_SEC:
+        return False
+    LAST_LOCK_ALERT_AT = now
+    return True
 
 
 def classify_alert(endpoint: str, result: Dict[str, Any], markers: List[Dict[str, Any]]) -> Dict[str, str]:
@@ -403,20 +429,32 @@ def invoke(args: List[str]) -> Dict[str, Any]:
 def run_command(endpoint: str, args: List[str], lock_required: bool, notify: bool) -> Dict[str, Any]:
     run_id = uuid.uuid4().hex[:12]
     if lock_required and not MUTATING_LOCK.acquire(blocking=False):
+        active = dict(ACTIVE_RUN)
         result = {
             "ok": False,
             "code": 423,
             "locked": True,
-            "error": f"another product-intake run is active: {ACTIVE_RUN.get('run_id', 'unknown')}",
+            "error": f"another product-intake run is active: {active.get('run_id', 'unknown')}",
+            "active_run_id": active.get("run_id", "unknown"),
+            "active_endpoint": active.get("endpoint", "unknown"),
+            "active_age_sec": active_run_age_sec(active),
             "stdout": [],
         }
-        if notify:
+        if notify and should_notify_lock_alert(active):
             result["alert"] = notify_failure(endpoint, result, run_id, args)
+        elif notify:
+            result["alert"] = {
+                "sent": False,
+                "suppressed": True,
+                "reason": "short_lock_overlap",
+                "threshold_sec": LOCK_ALERT_AFTER_SEC,
+                "cooldown_sec": LOCK_ALERT_COOLDOWN_SEC,
+            }
         return result
 
     if lock_required:
         ACTIVE_RUN.clear()
-        ACTIVE_RUN.update({"run_id": run_id, "endpoint": endpoint})
+        ACTIVE_RUN.update({"run_id": run_id, "endpoint": endpoint, "started_at": now_utc()})
     try:
         result = invoke(args)
         result["run_id"] = run_id
@@ -437,6 +475,8 @@ def health() -> Dict[str, Any]:
         "features": {
             "run_lock": True,
             "error_alert": True,
+            "lock_alert_after_sec": LOCK_ALERT_AFTER_SEC,
+            "lock_alert_cooldown_sec": LOCK_ALERT_COOLDOWN_SEC,
             "resubmit_field": product_intake.FIELD_RESUBMIT,
         },
         "alert_config": {
