@@ -30,7 +30,9 @@ ERROR_ACTIONS = {"compose_error", "create_error", "create_failed"}
 MUTATING_LOCK = threading.Lock()
 ACTIVE_RUN: Dict[str, str] = {}
 
-app = FastAPI(title="Product Intake Service", version="1.0.0")
+APP_VERSION = "2026-07-01-p0-guards"
+
+app = FastAPI(title="Product Intake Service", version=APP_VERSION)
 
 
 class RunRequest(BaseModel):
@@ -227,7 +229,7 @@ def run_command(endpoint: str, args: List[str], lock_required: bool, notify: boo
 
 @app.get("/health")
 def health() -> Dict[str, str]:
-    return {"status": "ok"}
+    return {"status": "ok", "version": APP_VERSION}
 
 
 @app.post("/run")
