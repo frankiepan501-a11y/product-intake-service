@@ -10,6 +10,7 @@ from __future__ import annotations
 import io
 import json
 import os
+import re
 import threading
 import uuid
 from contextlib import redirect_stdout
@@ -34,7 +35,7 @@ LAST_LOCK_ALERT_AT: Optional[datetime] = None
 LOCK_ALERT_AFTER_SEC = int(os.getenv("PRODUCT_INTAKE_LOCK_ALERT_AFTER_SEC", "600"))
 LOCK_ALERT_COOLDOWN_SEC = int(os.getenv("PRODUCT_INTAKE_LOCK_ALERT_COOLDOWN_SEC", "1800"))
 
-APP_VERSION = "2026-07-01-lock-alert-throttle"
+APP_VERSION = "2026-07-01-alert-card-diagnosis"
 
 app = FastAPI(title="Product Intake Service", version=APP_VERSION)
 
@@ -177,7 +178,10 @@ def classify_alert(endpoint: str, result: Dict[str, Any], markers: List[Dict[str
         }
     actions = {str(item.get("action") or "") for item in markers}
     if "create_failed" in actions:
-        problem = "领星建品接口返回失败，产品没有成功写入领星。"
+        if markers_have_lingxing_sku_rule_error(markers):
+            problem = "领星拒绝建品：ERP SKU 含中文或非法字符，产品没有写入领星。"
+        else:
+            problem = "领星建品接口返回失败，产品没有成功写入领星。"
     elif "create_error" in actions:
         problem = "系统无法组装领星建品参数，通常是 SKU/品名/类目或物理字段不完整。"
     elif "compose_error" in actions:
@@ -189,7 +193,7 @@ def classify_alert(endpoint: str, result: Dict[str, Any], markers: List[Dict[str
         "template": "red" if "create_failed" in actions else "orange",
         "title": "🟠 [LOG·P1] 新品建档异常 · 需处理",
         "problem": problem,
-        "owner_action": "请采购先打开记录，按“具体报错/下一步”修正字段；无法判断时转系统负责人处理。修好后勾选「采购已修改」重新提交。",
+        "owner_action": owner_action_for_markers(markers),
     }
 
 
@@ -256,18 +260,71 @@ def format_error_block(markers: List[Dict[str, Any]], result: Dict[str, Any]) ->
         return "- 运行锁：上一轮任务仍在执行，本轮被拦截。不是采购资料错误。"
     if not markers and result.get("error"):
         return f"- 服务错误：{short_text(str(result.get('error')), 180)}"
+    if markers_have_lingxing_sku_rule_error(markers):
+        skus = unique_marker_skus(markers)
+        sku_lines = [f"  - `{sku}`" for sku in skus[:8]]
+        more = f"\n  - 另有 {len(skus) - 8} 个 SKU 同类问题" if len(skus) > 8 else ""
+        return "\n".join(
+            [
+                "- 根因：领星 SKU 字符规则校验失败，ERP SKU 里出现中文或非法字符。",
+                "- 需要修改：检查「颜色变体」和「套餐变体」，改成英文/数字代码；例如黑色=`BK`、白色=`WH`、银色=`SL` 或公司约定代码。",
+                "- 本次异常 SKU：",
+                *sku_lines,
+                more,
+                "- 领星规则：SKU 只允许字母、数字、下划线、短横线、英文点、井号、斜杆等字符，不允许中文。",
+            ]
+        ).strip()
     lines: List[str] = []
+    seen: set[tuple[str, str, str]] = set()
     for item in markers:
         action = str(item.get("action") or "error")
         rid = str(item.get("record_id") or "无记录")
-        raw = item.get("error") if item.get("error") is not None else item.get("result", "")
-        if not isinstance(raw, str):
-            raw = json.dumps(raw, ensure_ascii=False)
+        raw = marker_raw_text(item)
         human = humanize_error(action, raw)
+        key = (action, rid, human)
+        if key in seen:
+            continue
+        seen.add(key)
         lines.append(f"- {action} / {rid}：{human}")
-        if raw and human != raw:
+        if raw and human != raw and len(lines) <= 6:
             lines.append(f"  原始信息：{short_text(raw, 160)}")
     return "\n".join(lines) if lines else "- 未识别到具体错误，请看 replay 命令复现。"
+
+
+def marker_raw_text(item: Dict[str, Any]) -> str:
+    raw = item.get("error") if item.get("error") is not None else item.get("result", "")
+    if isinstance(raw, str):
+        return raw
+    return json.dumps(raw, ensure_ascii=False)
+
+
+def markers_have_lingxing_sku_rule_error(markers: List[Dict[str, Any]]) -> bool:
+    for item in markers:
+        text = marker_raw_text(item)
+        if "SKU 只允许" in text or ("SKU" in text and "只允许" in text and "英文" in text):
+            return True
+    return False
+
+
+def unique_marker_skus(markers: List[Dict[str, Any]]) -> List[str]:
+    out: List[str] = []
+    seen = set()
+    for item in markers:
+        sku = str(item.get("sku") or "").strip()
+        if not sku:
+            text = marker_raw_text(item)
+            found = re.findall(r"[A-Z]{2,}-[A-Z0-9]{2,}-[A-Z0-9]{2,}-[0-9]{3}(?:-[^\s\"',，；;]+)?", text)
+            sku = found[0] if found else ""
+        if sku and sku not in seen:
+            seen.add(sku)
+            out.append(sku)
+    return out
+
+
+def owner_action_for_markers(markers: List[Dict[str, Any]]) -> str:
+    if markers_have_lingxing_sku_rule_error(markers):
+        return "采购先打开上方产品记录，把「颜色变体/套餐变体」里的中文改成英文 SKU 代码；修好后勾选「采购已修改」重新提交。系统负责人只在不确定代码规则时介入。"
+    return "请采购先打开记录，按“具体报错/下一步”修正字段；无法判断时转系统负责人处理。修好后勾选「采购已修改」重新提交。"
 
 
 def humanize_error(action: str, raw: str) -> str:
@@ -286,6 +343,8 @@ def humanize_error(action: str, raw: str) -> str:
         return "款式为空。请填写外观/模具/功能形态短名，不要混入平台、颜色、工厂型号。"
     if "ERP SKU/ERP品名未合成" in text:
         return "记录还没有成功合成 ERP SKU/ERP 品名，不能进入领星建品。"
+    if "SKU 只允许" in text:
+        return "ERP SKU 含中文或非法字符。请把颜色/套餐变体改成英文 SKU 代码后重新提交。"
     if action == "create_failed":
         return "领星接口拒绝建品。通常需要系统负责人查看领星返回内容。"
     return short_text(text, 180) or "未提供错误明细。"
