@@ -31,7 +31,7 @@ ERROR_ACTIONS = {"compose_error", "create_error", "create_failed"}
 MUTATING_LOCK = threading.Lock()
 ACTIVE_RUN: Dict[str, str] = {}
 
-APP_VERSION = "2026-07-01-alert-card"
+APP_VERSION = "2026-07-01-p1-routing-config"
 
 app = FastAPI(title="Product Intake Service", version=APP_VERSION)
 

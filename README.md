@@ -9,6 +9,7 @@
 - 表单新记录如果已满足关键字段，自动补 `建档状态=待合成`。
 - `待合成` 记录自动合成 `ERP SKU`、`ERP品名`、类目字段，并转为 `待确认`。
 - 合成后给采购群发确认卡。是否真正建领星仍由确认按钮作为人审 gate。
+- 确认卡优先发给「录入采购」本人；采购群只发摘要。若无法识别录入采购或私聊失败，采购群兜底收到完整确认卡。
 - 采购退回修改后，改完资料勾选 `采购已修改`，系统会重新进入 `待合成` 并发新确认卡。
 - 采购确认后，`确认建品` 记录可由 `create-confirmed` 建入领星并回写 `已建领星`。
 - 支持 `--record-id` 单条回放，便于定位某一条为什么没跑。
@@ -50,6 +51,8 @@ $env:PRODUCT_INTAKE_CONFIRM_CHAT_ID="oc_73d455d69842f2104da68201dc282677"
 $env:PRODUCT_INTAKE_BASE_TOKEN="MvtZb6OE9aJFaisO913cWSErnFe"
 $env:PRODUCT_INTAKE_TABLE_ID="tblTvqipcTBFRUkr"
 $env:PRODUCT_INTAKE_CATEGORY_TABLE_ID="tbluZxoiRo1L0BLT"
+$env:PRODUCT_INTAKE_BRAND_TABLE_ID="tblYKn7n7DURgwBM"
+$env:PRODUCT_INTAKE_SUBMITTER_FIELD="录入采购"
 ```
 
 ## 常用命令
@@ -145,7 +148,12 @@ n8n 工作流：
 
 `品牌` 字段只填真正对外/内部识别品牌，不填供应商名、工厂名、公司名。
 
-当前品牌码：
+品牌码来源：
+
+- 正式来源：同一产品库 Base 的「品牌配置表」`tblYKn7n7DURgwBM`。
+- 代码内置品牌码只作兜底，避免飞书配置表临时不可读时生产链路直接中断。
+
+当前启用品牌码：
 
 - `FUNLAB` -> `FL`
 - `POWKONG` -> `PK`
@@ -189,7 +197,9 @@ n8n 工作流：
 当前正确口径：
 
 - 采购提交表单后，确认卡发给录入采购确认，不默认发给 Frankie。
-- 如果拿不到录入人的 event-hub App open_id / union_id，短期发到采购所在业务群，并在群里让录入采购确认。
+- 产品表已新增系统字段「录入采购」`fld6jY5RaQ`，类型为创建人，用来识别表单/记录录入人。
+- 服务通过聪哥2号读取记录和人员字段，转成 union_id 后用聪哥3号私聊发完整确认卡。
+- 私聊成功后，采购群只收到无按钮摘要；如果拿不到录入人或私聊失败，采购群收到完整确认卡兜底。
 - 当前默认采购群：`采购及产品项目部` / `oc_73d455d69842f2104da68201dc282677`。
 - Frankie 只收异常升级：品牌未知、SKU 冲突、类目缺失、按钮回调失败、领星建品失败。
 
@@ -197,4 +207,17 @@ n8n 工作流：
 
 - 聪哥3号发卡才能让按钮回调进入 n8n event-hub。
 - 不同飞书 App 的 open_id 不互通；不要把聪哥1号/2号 open_id 直接拿给聪哥3号发私聊。
-- 长期应在表中补「录入人/提交人」字段，或维护「采购 -> union_id / 聪哥3号 open_id」映射。
+- 若后续发现表单创建人仍是机器人而非采购本人，再把「录入采购」改为表单必填人员字段或维护「采购 -> union_id」映射。
+
+## 配置审计
+
+只读审计命令：
+
+```powershell
+python C:/Users/Administrator/scripts/product_intake/audit_config.py --format markdown
+```
+
+审计范围：
+
+- 品牌配置表：启用品牌是否有品牌码、品牌码格式、重复品牌/重复品牌码。
+- 类目配置表：必填字段、品类码/平台码格式、平台+品类组合重复、cid 是否数字、配置名重复、产品类型词是否过泛。

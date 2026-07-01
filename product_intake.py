@@ -30,8 +30,9 @@ FEISHU_BASE = "https://open.feishu.cn/open-apis"
 BASE_TOKEN = os.getenv("PRODUCT_INTAKE_BASE_TOKEN", "MvtZb6OE9aJFaisO913cWSErnFe")
 PRODUCT_TABLE_ID = os.getenv("PRODUCT_INTAKE_TABLE_ID", "tblTvqipcTBFRUkr")
 CATEGORY_TABLE_ID = os.getenv("PRODUCT_INTAKE_CATEGORY_TABLE_ID", "tbluZxoiRo1L0BLT")
+BRAND_TABLE_ID = os.getenv("PRODUCT_INTAKE_BRAND_TABLE_ID", "tblYKn7n7DURgwBM")
 
-DEFAULT_CONFIRM_EMAIL = os.getenv("PRODUCT_INTAKE_CONFIRM_EMAIL", "frankiepan501@gmail.com")
+DEFAULT_CONFIRM_EMAIL = os.getenv("PRODUCT_INTAKE_CONFIRM_EMAIL", "")
 DEFAULT_CONFIRM_UNION_ID = os.getenv("PRODUCT_INTAKE_CONFIRM_UNION_ID", "")
 DEFAULT_CONFIRM_OPEN_ID = os.getenv("PRODUCT_INTAKE_CONFIRM_OPEN_ID", "")
 DEFAULT_CONFIRM_CHAT_ID = os.getenv("PRODUCT_INTAKE_CONFIRM_CHAT_ID", "oc_73d455d69842f2104da68201dc282677")
@@ -62,12 +63,13 @@ FIELD_L2 = "二级分类"
 FIELD_PRODUCT_TYPE = "产品类型"
 FIELD_STATUS = "状态"
 FIELD_RESUBMIT = os.getenv("PRODUCT_INTAKE_RESUBMIT_FIELD", "采购已修改")
+FIELD_SUBMITTER = os.getenv("PRODUCT_INTAKE_SUBMITTER_FIELD", "录入采购")
 
 LX_CF_MAIN_PLATFORM = os.getenv("LINGXING_CF_MAIN_PLATFORM", "207716196418609155")
 LX_CF_COMPAT_PLATFORM = os.getenv("LINGXING_CF_COMPAT_PLATFORM", "207716196418609153")
 
 
-BRAND_CODES: Dict[str, str] = {
+DEFAULT_BRAND_CODES: Dict[str, str] = {
     "FUNLAB": "FL",
     "POWKONG": "PK",
     "联游": "LY",
@@ -75,6 +77,8 @@ BRAND_CODES: Dict[str, str] = {
     # 万利是品牌，不是供应商名；按用户确认纳入品牌口径。
     "万利": "WL",
 }
+
+BRAND_CODES = DEFAULT_BRAND_CODES
 
 
 SUPPLIER_WORDS = (
@@ -239,7 +243,7 @@ def list_records(client: FeishuClient, table_id: str, page_size: int = 500) -> L
         data = client.request(
             "POST",
             f"/bitable/v1/apps/{BASE_TOKEN}/tables/{table_id}/records/search{qs}",
-            body={"automatic_fields": False},
+            body={"automatic_fields": True},
         )
         payload = data.get("data", {})
         items.extend(payload.get("items", []))
@@ -271,6 +275,29 @@ def load_categories(client: FeishuClient) -> Dict[str, Dict[str, str]]:
     for row in rows:
         fields = row.get("fields", {})
         out[row["record_id"]] = {key: cell_text(fields.get(key)) for key in wanted}
+    return out
+
+
+def load_brand_codes(client: FeishuClient) -> Dict[str, str]:
+    try:
+        rows = list_records(client, BRAND_TABLE_ID)
+    except Exception as exc:
+        print(json.dumps({"action": "brand_config_fallback", "error": str(exc)}, ensure_ascii=False), file=sys.stderr)
+        return dict(DEFAULT_BRAND_CODES)
+
+    out: Dict[str, str] = {}
+    for row in rows:
+        fields = row.get("fields", {})
+        if not cell_bool(fields.get("启用")):
+            continue
+        brand = cell_text(fields.get("品牌"))
+        code = cell_text(fields.get("品牌码")).upper()
+        if not brand or not code:
+            continue
+        out[brand] = code
+    if not out:
+        print(json.dumps({"action": "brand_config_fallback", "error": "empty enabled brand table"}, ensure_ascii=False), file=sys.stderr)
+        return dict(DEFAULT_BRAND_CODES)
     return out
 
 
@@ -306,22 +333,23 @@ def next_sequence(prefix: str, existing_skus: Iterable[str]) -> str:
     return f"{max_num + 1:03d}"
 
 
-def looks_like_supplier_as_brand(brand: str) -> bool:
+def looks_like_supplier_as_brand(brand: str, brand_codes: Optional[Dict[str, str]] = None) -> bool:
     if not brand:
         return False
-    if brand in BRAND_CODES:
+    if brand in (brand_codes or DEFAULT_BRAND_CODES):
         return False
     return any(word in brand for word in SUPPLIER_WORDS)
 
 
-def validate_row(fields: Dict[str, Any]) -> Tuple[List[str], List[str]]:
+def validate_row(fields: Dict[str, Any], brand_codes: Optional[Dict[str, str]] = None) -> Tuple[List[str], List[str]]:
+    brand_codes = brand_codes or DEFAULT_BRAND_CODES
     errors: List[str] = []
     warnings: List[str] = []
     brand = cell_text(fields.get(FIELD_BRAND))
     if not brand:
         errors.append("品牌缺")
-    elif brand not in BRAND_CODES:
-        if looks_like_supplier_as_brand(brand):
+    elif brand not in brand_codes:
+        if looks_like_supplier_as_brand(brand, brand_codes):
             errors.append(f"品牌疑似供应商名: {brand}")
         else:
             errors.append(f"品牌未配置品牌码: {brand}")
@@ -373,8 +401,14 @@ def should_default_to_todo(fields: Dict[str, Any]) -> bool:
     return False
 
 
-def compose_row(fields: Dict[str, Any], categories: Dict[str, Dict[str, str]], existing_skus: Iterable[str]) -> Tuple[Dict[str, Any], List[str]]:
-    errors, warnings = validate_row(fields)
+def compose_row(
+    fields: Dict[str, Any],
+    categories: Dict[str, Dict[str, str]],
+    existing_skus: Iterable[str],
+    brand_codes: Optional[Dict[str, str]] = None,
+) -> Tuple[Dict[str, Any], List[str]]:
+    brand_codes = brand_codes or DEFAULT_BRAND_CODES
+    errors, warnings = validate_row(fields, brand_codes)
     if errors:
         raise ValueError("; ".join(errors))
 
@@ -384,7 +418,7 @@ def compose_row(fields: Dict[str, Any], categories: Dict[str, Dict[str, str]], e
     if not category:
         raise ValueError(f"类目配置未找到: {category_id}")
 
-    prefix = f"{BRAND_CODES[brand]}-{category['品类码']}-{category['平台码']}-"
+    prefix = f"{brand_codes[brand]}-{category['品类码']}-{category['平台码']}-"
     sequence = next_sequence(prefix, existing_skus)
     variants = [cell_text(fields.get(FIELD_COLOR)), cell_text(fields.get(FIELD_BUNDLE))]
     variants = [item for item in variants if item]
@@ -538,8 +572,96 @@ def build_card(record_id: str, fields: Dict[str, Any], warnings: List[str]) -> D
     }
 
 
+def user_cell_items(value: Any) -> List[Dict[str, str]]:
+    if not isinstance(value, list):
+        return []
+    out: List[Dict[str, str]] = []
+    for item in value:
+        if not isinstance(item, dict):
+            continue
+        user_id = str(item.get("id") or item.get("user_id") or item.get("open_id") or "").strip()
+        name = str(item.get("name") or "").strip()
+        if user_id:
+            out.append({"id": user_id, "name": name})
+    return out
+
+
+def resolve_union_id(client: FeishuClient, open_id: str) -> str:
+    if not open_id:
+        return ""
+    try:
+        data = client.request("GET", f"/contact/v3/users/{open_id}?user_id_type=open_id")
+    except Exception as exc:
+        print(json.dumps({"action": "resolve_union_id_failed", "open_id": open_id, "error": str(exc)}, ensure_ascii=False), file=sys.stderr)
+        return ""
+    user = data.get("data", {}).get("user", {})
+    return str(user.get("union_id") or "").strip()
+
+
+def submitter_target(client: FeishuClient, fields: Dict[str, Any]) -> Tuple[str, str]:
+    for item in user_cell_items(fields.get(FIELD_SUBMITTER)):
+        name = item.get("name", "")
+        open_id = item.get("id", "")
+        if not open_id or "分身" in name or name.lower().endswith("bot"):
+            continue
+        union_id = resolve_union_id(client, open_id)
+        if union_id:
+            return union_id, name
+    return "", ""
+
+
+def build_group_summary_card(record_id: str, fields: Dict[str, Any], receiver_name: str, personal_sent: bool) -> Dict[str, Any]:
+    sku = cell_text(fields.get(FIELD_ERP_SKU))
+    erp_name = cell_text(fields.get(FIELD_ERP_NAME))
+    brand = cell_text(fields.get(FIELD_BRAND))
+    summary = "\n".join(
+        [
+            md_line("产品", erp_name or sku or record_id),
+            md_line("ERP SKU", sku),
+            md_line("品牌", brand),
+            md_line("确认人", receiver_name or "未识别，已改群内兜底"),
+            md_line("状态", "已私聊录入采购" if personal_sent else "群内兜底确认"),
+        ]
+    )
+    return {
+        "config": {"wide_screen_mode": True},
+        "header": {
+            "template": "blue" if personal_sent else "orange",
+            "title": {"tag": "plain_text", "content": "🟡 [LOG·P2] 新品建档确认卡 · 采购确认"},
+        },
+        "elements": [
+            {"tag": "div", "text": {"tag": "lark_md", "content": summary}},
+            {
+                "tag": "action",
+                "actions": [
+                    {
+                        "tag": "button",
+                        "text": {"tag": "plain_text", "content": "打开记录"},
+                        "type": "default",
+                        "url": record_url(record_id),
+                    }
+                ],
+            },
+        ],
+    }
+
+
+def send_interactive(event_client: FeishuClient, receive_id_type: str, receive_id: str, card: Dict[str, Any]) -> str:
+    resp = event_client.request(
+        "POST",
+        f"/im/v1/messages?receive_id_type={receive_id_type}",
+        body={
+            "receive_id": receive_id,
+            "msg_type": "interactive",
+            "content": json.dumps(card, ensure_ascii=False),
+        },
+    )
+    return resp.get("data", {}).get("message_id", "")
+
+
 def send_card(
     event_client: FeishuClient,
+    identity_client: FeishuClient,
     email: str,
     union_id: str,
     open_id: str,
@@ -548,65 +670,59 @@ def send_card(
     fields: Dict[str, Any],
     warnings: List[str],
 ) -> str:
-    if chat_id:
-        resp = event_client.request(
-            "POST",
-            "/im/v1/messages?receive_id_type=chat_id",
-            body={
-                "receive_id": chat_id,
-                "msg_type": "interactive",
-                "content": json.dumps(build_card(record_id, fields, warnings), ensure_ascii=False),
-            },
-        )
-        return resp.get("data", {}).get("message_id", "")
+    card = build_card(record_id, fields, warnings)
+    target_union_id = union_id
+    target_name = ""
+    if not target_union_id and not open_id and not email:
+        target_union_id, target_name = submitter_target(identity_client, fields)
 
+    personal_msg_id = ""
+    personal_error = ""
     if open_id:
-        resp = event_client.request(
-            "POST",
-            "/im/v1/messages?receive_id_type=open_id",
-            body={
-                "receive_id": open_id,
-                "msg_type": "interactive",
-                "content": json.dumps(build_card(record_id, fields, warnings), ensure_ascii=False),
-            },
-        )
-        return resp.get("data", {}).get("message_id", "")
+        try:
+            personal_msg_id = send_interactive(event_client, "open_id", open_id, card)
+        except Exception as exc:
+            personal_error = f"open_id: {exc}"
+    elif target_union_id:
+        try:
+            personal_msg_id = send_interactive(event_client, "union_id", target_union_id, card)
+        except Exception as exc:
+            personal_error = f"union_id: {exc}"
+    elif email:
+        try:
+            user_resp = event_client.request(
+                "POST",
+                "/contact/v3/users/batch_get_id?user_id_type=open_id",
+                body={"emails": [email]},
+            )
+            user_id = ""
+            for item in user_resp.get("data", {}).get("user_list", []):
+                if item.get("user_id"):
+                    user_id = item["user_id"]
+                    break
+            if user_id:
+                personal_msg_id = send_interactive(event_client, "open_id", user_id, card)
+            else:
+                personal_error = "email: cannot resolve user"
+        except Exception as exc:
+            personal_error = f"email: {exc}"
 
-    if union_id:
-        resp = event_client.request(
-            "POST",
-            "/im/v1/messages?receive_id_type=union_id",
-            body={
-                "receive_id": union_id,
-                "msg_type": "interactive",
-                "content": json.dumps(build_card(record_id, fields, warnings), ensure_ascii=False),
-            },
-        )
-        return resp.get("data", {}).get("message_id", "")
+    if chat_id:
+        if personal_msg_id:
+            summary_msg_id = send_interactive(
+                event_client,
+                "chat_id",
+                chat_id,
+                build_group_summary_card(record_id, fields, target_name or "录入采购", True),
+            )
+            return personal_msg_id + (f",{summary_msg_id}" if summary_msg_id else "")
+        group_msg_id = send_interactive(event_client, "chat_id", chat_id, card)
+        print(json.dumps({"action": "send_card_group_fallback", "record_id": record_id, "reason": personal_error or "no_submitter"}, ensure_ascii=False))
+        return group_msg_id
 
-    user_resp = event_client.request(
-        "POST",
-        "/contact/v3/users/batch_get_id?user_id_type=open_id",
-        body={"emails": [email]},
-    )
-    user_id = ""
-    for item in user_resp.get("data", {}).get("user_list", []):
-        if item.get("user_id"):
-            user_id = item["user_id"]
-            break
-    if not user_id:
-        raise RuntimeError("Cannot resolve card receiver. Provide --confirm-open-id or --confirm-union-id.")
-
-    resp = event_client.request(
-        "POST",
-        "/im/v1/messages?receive_id_type=open_id",
-        body={
-            "receive_id": user_id,
-            "msg_type": "interactive",
-            "content": json.dumps(build_card(record_id, fields, warnings), ensure_ascii=False),
-        },
-    )
-    return resp.get("data", {}).get("message_id", "")
+    if personal_msg_id:
+        return personal_msg_id
+    raise RuntimeError("Cannot resolve card receiver. Provide submitter/confirm-open-id/confirm-union-id or confirm-chat-id.")
 
 
 def select_target_records(records: List[Dict[str, Any]], record_id: Optional[str]) -> List[Dict[str, Any]]:
@@ -616,6 +732,7 @@ def select_target_records(records: List[Dict[str, Any]], record_id: Optional[str
 
 
 def cmd_default_status(client: FeishuClient, args: argparse.Namespace) -> int:
+    brand_codes = load_brand_codes(client)
     records = select_target_records(list_records(client, PRODUCT_TABLE_ID), args.record_id)
     changed = 0
     for row in records:
@@ -623,7 +740,7 @@ def cmd_default_status(client: FeishuClient, args: argparse.Namespace) -> int:
         fields = row.get("fields", {})
         if not should_default_to_todo(fields):
             continue
-        errors, warnings = validate_row(fields)
+        errors, warnings = validate_row(fields, brand_codes)
         payload = {STATUS_FIELD: STATUS_TODO}
         if FIELD_RESUBMIT in fields:
             payload[FIELD_RESUBMIT] = False
@@ -638,6 +755,7 @@ def cmd_default_status(client: FeishuClient, args: argparse.Namespace) -> int:
 
 def cmd_compose(client: FeishuClient, cfg: Config, args: argparse.Namespace) -> int:
     categories = load_categories(client)
+    brand_codes = load_brand_codes(client)
     proxy = LingxingProxy(cfg.lingxing_proxy_url, cfg.lingxing_proxy_token)
     existing_skus = product_skus_from_lingxing(proxy)
     event_client = None
@@ -652,7 +770,7 @@ def cmd_compose(client: FeishuClient, cfg: Config, args: argparse.Namespace) -> 
         if cell_text(fields.get(STATUS_FIELD)) != STATUS_TODO:
             continue
         try:
-            payload, warnings = compose_row(fields, categories, existing_skus)
+            payload, warnings = compose_row(fields, categories, existing_skus, brand_codes)
         except Exception as exc:
             print(json.dumps({"action": "compose_error", "record_id": rid, "error": str(exc)}, ensure_ascii=False))
             if args.mark_failed and not args.dry_run:
@@ -667,6 +785,7 @@ def cmd_compose(client: FeishuClient, cfg: Config, args: argparse.Namespace) -> 
                 assert event_client is not None
                 msg_id = send_card(
                     event_client,
+                    client,
                     args.confirm_email,
                     args.confirm_union_id,
                     args.confirm_open_id,
@@ -694,7 +813,7 @@ def cmd_send_card(client: FeishuClient, cfg: Config, args: argparse.Namespace) -
         raise SystemExit("send-card requires --record-id")
     row = get_record(client, args.record_id)
     fields = row.get("fields", {})
-    errors, warnings = validate_row(fields)
+    errors, warnings = validate_row(fields, load_brand_codes(client))
     if not cell_text(fields.get(FIELD_ERP_SKU)) or not cell_text(fields.get(FIELD_ERP_NAME)):
         errors.append("ERP SKU/ERP品名未合成")
     if errors:
@@ -704,6 +823,7 @@ def cmd_send_card(client: FeishuClient, cfg: Config, args: argparse.Namespace) -
         event_client = FeishuClient(cfg.feishu_event_app_id, cfg.feishu_event_app_secret)
         msg_id = send_card(
             event_client,
+            client,
             args.confirm_email,
             args.confirm_union_id,
             args.confirm_open_id,
